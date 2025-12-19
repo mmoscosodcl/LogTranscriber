@@ -9,9 +9,15 @@ from dotenv import load_dotenv
 import paramiko
 from scp import SCPClient
 import jwt
+import time
 
 # Load environment variables
-load_dotenv()
+# Priority: 1. /etc/logtranscriber/config.env (Production), 2. .env (Development)
+config_path = '/etc/logtranscriber/config.env'
+if os.path.exists(config_path):
+    load_dotenv(config_path)
+else:
+    load_dotenv()
 
 # Configuration
 SSH_HOST = os.getenv('SSH_HOST')
@@ -20,7 +26,7 @@ SSH_PASS = os.getenv('SSH_PASS')
 REMOTE_LOG_PATH = os.getenv('REMOTE_LOG_PATH')
 LOCAL_LOG_PATH = os.getenv('LOCAL_LOG_PATH', './logs/')
 JWT_SECRET = os.getenv('JWT_SECRET')
-DATA_OUTPUT_PATH = './data/'
+DATA_OUTPUT_PATH = os.getenv('DATA_OUTPUT_PATH', './data/')
 
 # Setup Logging to Syslog
 logger = logging.getLogger('LogTranscriber')
@@ -158,6 +164,100 @@ def parse_log_line(line):
         logger.warning(f"Error parsing line: {line[:50]}... Error: {e}")
         return None
 
+def generate_summary(entries):
+    """
+    Generates a summary dictionary from a list of log entries.
+    """
+    unique_ips = set()
+    unique_urls = set()
+    unique_users = set()
+    
+    url_stats = {} # url -> {run: set(), count: 0}
+    user_stats = {} # run -> set(urls)
+    
+    timestamps = []
+
+    for entry in entries:
+        # IP
+        if entry.get('ip'):
+            unique_ips.add(entry['ip'])
+        
+        # Date for start/end
+        if entry.get('date'):
+            timestamps.append(entry['date'])
+
+        # User (RUN)
+        run = None
+        if entry.get('t_decoded') and isinstance(entry['t_decoded'], dict):
+            run = entry['t_decoded'].get('run')
+            # Handle case where run might be int or string
+            if run is not None:
+                run = str(run)
+        
+        # URL Key
+        raw_url = entry.get('url', '')
+        url_key = raw_url
+        if '?t=' in raw_url:
+            url_key = raw_url.split('?t=')[0] + '?t='
+        elif '&t=' in raw_url:
+             parts = raw_url.split('&t=')
+             url_key = parts[0] + '&t='
+        
+        if run:
+            unique_users.add(run)
+            
+            # Update URL stats
+            if url_key not in url_stats:
+                url_stats[url_key] = {'run': set()}
+            url_stats[url_key]['run'].add(run)
+            
+            # Update User stats
+            if run not in user_stats:
+                user_stats[run] = set()
+            user_stats[run].add(url_key)
+            
+        unique_urls.add(url_key)
+
+    # Sort timestamps to find start/end
+    # We assume format is consistent: 09/Dec/2025:04:43:12 -0300
+    def parse_ts(ts):
+        try:
+            return datetime.strptime(ts, '%d/%b/%Y:%H:%M:%S %z')
+        except:
+            return None
+
+    valid_timestamps = [ts for ts in timestamps if ts]
+    # Sort by parsed datetime
+    sorted_timestamps = sorted(valid_timestamps, key=lambda x: parse_ts(x) or datetime.min) if valid_timestamps else []
+    
+    date_start = sorted_timestamps[0] if sorted_timestamps else None
+    date_end = sorted_timestamps[-1] if sorted_timestamps else None
+
+    # Format output
+    summary = {
+        "ip": list(unique_ips),
+        "ip_amount": len(unique_ips),
+        "date_start": date_start,
+        "date_end": date_end,
+        "url": {},
+        "url_amount": len(url_stats), # Counting URLs with authenticated activity
+        "users": {},
+        "users_amount": len(unique_users)
+    }
+
+    # Populate URL dict
+    for u, data in url_stats.items():
+        summary["url"][u] = {
+            "run": list(data['run']),
+            "count": len(data['run'])
+        }
+
+    # Populate Users dict
+    for r, urls in user_stats.items():
+        summary["users"][r] = list(urls)
+
+    return summary
+
 def process_logs():
     """
     Iterates through local .gz logs, parses them, and aggregates data.
@@ -200,9 +300,18 @@ def process_logs():
                             
                         except Exception as e:
                             logger.warning(f"Error parsing date from {parsed_data['date']}: {e}")
+                            # Press any key for continued
+
+                    
+                    # To avoid overwhelming the logger in case of large files
+                    
+
+
+
                             
         except Exception as e:
             logger.error(f"Error reading file {file_path}: {e}")
+
 
     # Write aggregated data to JSON files
     for date_key, entries in aggregated_data.items():
@@ -214,6 +323,18 @@ def process_logs():
                 json.dump(entries, f, indent=4)
         except Exception as e:
             logger.error(f"Error writing to {output_file}: {e}")
+
+
+        # Generate and write summary
+        try:
+            summary = generate_summary(entries)
+            summary_file = os.path.join(DATA_OUTPUT_PATH, f"{date_key}-summary.json")
+            logger.info(f"Writing summary to {summary_file}")
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error generating/writing summary for {date_key}: {e}")
+
 
     logger.info("Log processing complete.")
 
