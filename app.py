@@ -92,6 +92,11 @@ def fetch_logs():
                 try:
                     scp.get(file_path, local_file)
                     logger.info(f"Successfully downloaded {file_name}")
+
+                    # Delete remote file after successful download
+                    logger.info(f"Deleting remote file {file_path}")
+                    ssh.exec_command(f"rm {file_path}")
+
                 except Exception as e:
                     logger.error(f"Failed to download {file_name}: {e}")
 
